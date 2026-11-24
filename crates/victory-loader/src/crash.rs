@@ -6,7 +6,7 @@
 //! first-chance, since a handler may still take them (ntdll's loader does
 //! with its own probes). What nobody handles, of any kind (an uncaught C++
 //! exception too), is reported from the unhandled-exception filter
-//! (`report_unhandled`, which the runtime calls ahead of the title's own)
+//! (`report_unhandled`, which the runtime calls instead of the title's own)
 //! and appended to the crash log, with the title's last debug output, which
 //! often states the reason. Panics of ours go to the crash log too.
 
@@ -113,11 +113,13 @@ pub fn report_crashes() {
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         unsafe { report_unhandled(info) };
-        EXCEPTION_CONTINUE_SEARCH
+        // EXCEPTION_EXECUTE_HANDLER: the crash was recorded locally;
+        // do not continue into host error reporting.
+        1
     }
     // SAFETY: registers handlers that only read the exception they are
     // given; the title's own filter, once it sets one, takes the place of
-    // ours and calls `report_unhandled` first.
+    // ours with another local-only filter and never invokes title reporters.
     unsafe {
         AddVectoredExceptionHandler(0, Some(handler));
         SetUnhandledExceptionFilter(Some(filter));

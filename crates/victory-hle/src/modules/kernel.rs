@@ -255,26 +255,27 @@ pub extern "C" fn _invalid_parameter_noinfo_noreturn() -> ! {
     host::abort()
 }
 
-/// The title's unhandled-exception filter. Ours stands in front of it and
-/// reports the crash first; the title still gets its own back.
+/// Retained only to preserve SetUnhandledExceptionFilter's previous-value
+/// contract. Title crash callbacks are never invoked: they may collect
+/// telemetry and attempt to upload it. VIctory records crashes locally.
 static TITLE_FILTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub extern "system" fn SetUnhandledExceptionFilter(filter: usize) -> usize {
     host::set_unhandled_exception_filter(report_unhandled);
+    if filter != 0 {
+        static NOTICE: std::sync::Once = std::sync::Once::new();
+        NOTICE.call_once(|| {
+            tracing::info!("title crash callbacks disabled; crash reports stay local");
+        });
+    }
     TITLE_FILTER.swap(filter, std::sync::atomic::Ordering::AcqRel)
 }
 
 extern "system" fn report_unhandled(info: *const c_void) -> i32 {
     host::report_unhandled(info);
-    match TITLE_FILTER.load(std::sync::atomic::Ordering::Acquire) {
-        0 => 0, // EXCEPTION_CONTINUE_SEARCH
-        filter => {
-            type Filter = extern "system" fn(*const c_void) -> i32;
-            // SAFETY: the title registered this filter.
-            let filter: Filter = unsafe { std::mem::transmute(filter) };
-            filter(info)
-        }
-    }
+    // EXCEPTION_EXECUTE_HANDLER: finish exception handling without calling
+    // the title's reporter or falling through to host error reporting.
+    1
 }
 
 /// See [`exit`]; only the current process is logged.
@@ -595,6 +596,52 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn unhandled_crashes_keep_title_reporters_disabled() {
+        const CHILD: &str = "VICTORY_TEST_LOCAL_CRASH_DIR";
+        const CODE: u32 = 0xe042_4242;
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = std::path::PathBuf::from(dir);
+            extern "system" fn title_reporter(_: *const c_void) -> i32 {
+                let dir = std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());
+                std::fs::write(dir.join("title-reporter-ran"), "unexpected callback").unwrap();
+                0
+            }
+            victory_loader::log_crashes_to(dir.join("crashes.log"));
+            let filter = title_reporter as *const () as usize;
+            assert_eq!(SetUnhandledExceptionFilter(filter), 0);
+            assert_eq!(SetUnhandledExceptionFilter(0), filter);
+            assert_eq!(SetUnhandledExceptionFilter(filter), 0);
+            // SAFETY: deliberately raises an unhandled, noncontinuable
+            // exception in an isolated child to exercise real OS dispatch.
+            unsafe {
+                windows_sys::Win32::System::Diagnostics::Debug::RaiseException(
+                    CODE, 1, 0, std::ptr::null(),
+                );
+            }
+            panic!("the unhandled exception unexpectedly returned");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "modules::kernel::tests::unhandled_crashes_keep_title_reporters_disabled",
+                "--nocapture",
+            ])
+            .env(CHILD, dir.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "the crash child must terminate");
+        assert!(
+            !dir.path().join("title-reporter-ran").exists(),
+            "the title's crash reporter was invoked"
+        );
+        let report = std::fs::read_to_string(dir.path().join("crashes.log"))
+            .unwrap_or_else(|e| panic!("no local crash report: {e}; child: {output:?}"));
+        assert!(report.contains("unhandled exception 0xe0424242"), "{report}");
+    }
 
     #[test]
     fn title_images_report_their_original_path() {
