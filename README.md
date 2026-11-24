@@ -50,6 +50,10 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+Experimental Apple Silicon support runs the Windows executable through
+Wine and Rosetta. See [docs/macos.md](docs/macos.md) for setup, the memory
+compatibility fallback, and the current test results.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase

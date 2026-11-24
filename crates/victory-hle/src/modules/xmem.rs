@@ -132,7 +132,9 @@ pub extern "system" fn XMemVirtualAlloc(
         // The GPU side copies only the pages the title wrote since its last
         // copy (`victory_gpu`, decision 0007); placeholders cannot be
         // watched (their physical-page views are copied whole).
-        if kind & MEM_RESERVE_PLACEHOLDER == 0 {
+        if kind & MEM_RESERVE_PLACEHOLDER == 0
+            && victory_gpu::compat::fault_based_write_tracking_supported()
+        {
             kind |= MEM_WRITE_WATCH;
         }
     }
@@ -938,6 +940,47 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn rosetta_avx_store_crosses_a_host_page_in_title_memory() {
+        if victory_gpu::compat::fault_based_write_tracking_supported() {
+            return;
+        }
+        // Execute AVX directly, as the title does. Wine's Windows XState
+        // reporting can make std's AVX detection false under Rosetta even
+        // when these instructions execute correctly.
+        let p = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            64 << 10,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert!(!p.is_null());
+        #[target_feature(enable = "avx")]
+        unsafe fn store(at: *mut u8) {
+            // SAFETY: the caller provides 32 committed writable bytes. Crossing
+            // the 16 KiB macOS page used to abort Rosetta with MEM_WRITE_WATCH.
+            unsafe {
+                std::arch::asm!(
+                    "vxorps ymm0, ymm0, ymm0",
+                    "vmovups ymmword ptr [{at}], ymm0",
+                    "vzeroupper",
+                    at = in(reg) at,
+                    out("ymm0") _,
+                    options(nostack),
+                );
+            }
+        }
+        // SAFETY: the reservation holds 64 KiB and AVX is available.
+        unsafe {
+            let at = p.cast::<u8>().add(0x3ff0);
+            store(at);
+            assert_eq!(std::slice::from_raw_parts(at, 32), &[0; 32]);
+            assert_ne!(VirtualFree(p, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
     fn virtual_alloc_meets_console_constraints() {
         const GPU_READ_WRITE: u32 = 0x2000;
         let p = XMemVirtualAlloc(
@@ -967,7 +1010,14 @@ mod tests {
                 &mut granularity,
             )
         };
-        assert_eq!(watched, 0);
+        if victory_gpu::compat::fault_based_write_tracking_supported() {
+            assert_eq!(watched, 0);
+        } else {
+            assert_ne!(
+                watched, 0,
+                "Rosetta-compatible allocations must not be write-watched"
+            );
+        }
         // SAFETY: our own reservation.
         assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
         assert_eq!(query(p).flags, 0);
